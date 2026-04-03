@@ -180,3 +180,114 @@ def test_map_employee_ids_integration(tmp_path: Path) -> None:
     exceptions_ws = out_wb["Exceptions"]
     assert exceptions_ws.max_row == 2
     assert "Ambiguous" in str(exceptions_ws.cell(row=2, column=6).value)
+
+
+def test_total_hours_sheet_writes_file_number_column(tmp_path: Path) -> None:
+    agency_path = tmp_path / "hours.xlsx"
+    master_path = tmp_path / "master.xlsx"
+    output_path = tmp_path / "hours_adp_mapped.xlsx"
+
+    agency_wb = Workbook()
+    agency_hours_ws = agency_wb.active
+    agency_hours_ws.title = "Agency Hours"
+    agency_hours_ws.append(
+        [
+            "Employee ID",
+            "Employee Last Name",
+            "Employee First Name",
+            "Hours",
+        ]
+    )
+    agency_hours_ws.append(["9990000", "Ignore", "Me", 10])
+
+    total_hours_ws = agency_wb.create_sheet("Total Hours")
+    total_hours_ws.append(
+        [
+            "File # ",
+            "Employee ID",
+            "Employee Last Name",
+            "Employee First Name",
+            "Total Regular  Hours ",
+        ]
+    )
+    total_hours_ws.append([None, "5355118", "Aery", "Meenu", 65.1])
+    agency_wb.save(agency_path)
+
+    master_wb = Workbook()
+    master_ws = master_wb.active
+    master_ws.title = "1"
+    master_ws.append(
+        [
+            "Employee First Name",
+            "Employee Last  Name",
+            "File Number",
+            "Tax ID (SIN)",
+        ]
+    )
+    master_ws.append(["Meenu", "Aery", "975806", "111 111 118"])
+    master_wb.save(master_path)
+
+    stats = map_employee_ids(
+        agency_workbook_path=agency_path,
+        master_workbook_path=master_path,
+        output_path=output_path,
+        exceptions_sheet_name="Exceptions",
+        agency_sheet_name="Total Hours",
+    )
+
+    assert stats.processed_rows == 1
+    assert stats.mapped_rows == 1
+    assert stats.unchanged_rows == 0
+    assert stats.exceptions_count == 0
+
+    out_wb = load_workbook(output_path)
+    out_total_hours_ws = out_wb["Total Hours"]
+    out_agency_hours_ws = out_wb["Agency Hours"]
+
+    # Auto target column prefers File # when available.
+    assert out_total_hours_ws.cell(row=2, column=1).value == "975806"
+    # Source Employee ID remains unchanged in Total Hours sheet.
+    assert out_total_hours_ws.cell(row=2, column=2).value == "5355118"
+    # Non-target sheets are untouched.
+    assert out_agency_hours_ws.cell(row=2, column=1).value == "9990000"
+
+
+def test_file_sharp_header_auto_target(tmp_path: Path) -> None:
+    agency_path = tmp_path / "hours_file_sharp.xlsx"
+    master_path = tmp_path / "master_file_sharp.xlsx"
+    output_path = tmp_path / "hours_file_sharp_out.xlsx"
+
+    agency_wb = Workbook()
+    ws = agency_wb.active
+    ws.title = "Total Hours"
+    ws.append(["File#", "Employee ID", "Employee Last Name", "Employee First Name"])
+    ws.append([None, "5355118", "Aery", "Meenu"])
+    agency_wb.save(agency_path)
+
+    master_wb = Workbook()
+    master_ws = master_wb.active
+    master_ws.title = "1"
+    master_ws.append(
+        [
+            "Employee First Name",
+            "Employee Last  Name",
+            "File Number",
+            "Tax ID (SIN)",
+        ]
+    )
+    master_ws.append(["Meenu", "Aery", "975806", "999 995 118"])
+    master_wb.save(master_path)
+
+    map_employee_ids(
+        agency_workbook_path=agency_path,
+        master_workbook_path=master_path,
+        output_path=output_path,
+        exceptions_sheet_name="Exceptions",
+        agency_sheet_name="Total Hours",
+    )
+
+    out_wb = load_workbook(output_path)
+    out_ws = out_wb["Total Hours"]
+
+    assert out_ws.cell(row=2, column=1).value == "975806"
+    assert out_ws.cell(row=2, column=2).value == "5355118"

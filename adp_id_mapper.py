@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from openpyxl import load_workbook
 from openpyxl.workbook import Workbook
@@ -31,6 +31,10 @@ MASTER_REQUIRED_HEADERS = frozenset(
         "file number",
     }
 )
+DEFAULT_SOURCE_ID_HEADER = "employee id"
+DEFAULT_FIRST_NAME_HEADER = "employee first name"
+DEFAULT_LAST_NAME_HEADER = "employee last name"
+FILE_NUMBER_TARGET_CANDIDATES = ("file #", "file#", "file number")
 
 
 @dataclass(frozen=True)
@@ -142,6 +146,49 @@ def find_sheet_and_header(
     raise ValueError(
         f"Could not find a sheet in {workbook_label} with required headers: {missing}"
     )
+
+
+def find_named_sheet_and_header(
+    workbook: Workbook,
+    sheet_name: str,
+    required_headers: frozenset[str],
+    workbook_label: str,
+) -> tuple[Worksheet, HeaderInfo]:
+    if sheet_name not in workbook.sheetnames:
+        raise ValueError(
+            f"Sheet '{sheet_name}' was not found in {workbook_label}. "
+            f"Available sheets: {', '.join(workbook.sheetnames)}"
+        )
+
+    worksheet = workbook[sheet_name]
+    header_info = find_header_info(worksheet, required_headers)
+    if header_info is None:
+        missing = ", ".join(sorted(required_headers))
+        raise ValueError(
+            f"Sheet '{sheet_name}' in {workbook_label} is missing required headers: {missing}"
+        )
+
+    return worksheet, header_info
+
+
+def resolve_target_column_key(
+    agency_header: HeaderInfo,
+    source_id_header_key: str,
+    explicit_target_header: str | None,
+) -> str:
+    if explicit_target_header:
+        target_key = canonical_header(explicit_target_header)
+        if target_key not in agency_header.column_by_header:
+            raise ValueError(
+                f"Target column '{explicit_target_header}' was not found in the selected agency sheet."
+            )
+        return target_key
+
+    for candidate in FILE_NUMBER_TARGET_CANDIDATES:
+        if candidate in agency_header.column_by_header:
+            return candidate
+
+    return source_id_header_key
 
 
 def build_master_index(
@@ -325,16 +372,35 @@ def map_employee_ids(
     master_workbook_path: Path,
     output_path: Path | None,
     exceptions_sheet_name: str,
+    agency_sheet_name: str | None = None,
+    source_id_column_header: str = "Employee ID",
+    target_column_header: str | None = None,
 ) -> MappingStats:
     agency_workbook = load_workbook(agency_workbook_path)
     master_workbook = load_workbook(master_workbook_path, data_only=True)
 
     try:
-        agency_sheet, agency_header = find_sheet_and_header(
-            agency_workbook,
-            AGENCY_REQUIRED_HEADERS,
-            workbook_label=str(agency_workbook_path),
+        source_id_key = canonical_header(source_id_column_header)
+        first_name_key = DEFAULT_FIRST_NAME_HEADER
+        last_name_key = DEFAULT_LAST_NAME_HEADER
+
+        agency_required_headers = frozenset(
+            {source_id_key, first_name_key, last_name_key}
         )
+
+        if agency_sheet_name:
+            agency_sheet, agency_header = find_named_sheet_and_header(
+                agency_workbook,
+                sheet_name=agency_sheet_name,
+                required_headers=agency_required_headers,
+                workbook_label=str(agency_workbook_path),
+            )
+        else:
+            agency_sheet, agency_header = find_sheet_and_header(
+                agency_workbook,
+                agency_required_headers,
+                workbook_label=str(agency_workbook_path),
+            )
         master_sheet, master_header = find_sheet_and_header(
             master_workbook,
             MASTER_REQUIRED_HEADERS,
@@ -344,9 +410,15 @@ def map_employee_ids(
         master_index = build_master_index(master_sheet, master_header)
         master_name_index = build_name_index(master_index)
 
-        id_col = agency_header.column_by_header["employee id"]
-        first_col = agency_header.column_by_header["employee first name"]
-        last_col = agency_header.column_by_header["employee last name"]
+        id_col = agency_header.column_by_header[source_id_key]
+        first_col = agency_header.column_by_header[first_name_key]
+        last_col = agency_header.column_by_header[last_name_key]
+        target_key = resolve_target_column_key(
+            agency_header,
+            source_id_header_key=source_id_key,
+            explicit_target_header=target_column_header,
+        )
+        target_col = agency_header.column_by_header[target_key]
 
         processed_rows = 0
         mapped_rows = 0
@@ -384,7 +456,7 @@ def map_employee_ids(
             )
 
             if resolution.file_number is not None:
-                target_cell = agency_sheet.cell(row=row_idx, column=id_col)
+                target_cell = agency_sheet.cell(row=row_idx, column=target_col)
                 target_cell.value = resolution.file_number
                 target_cell.number_format = "@"
                 mapped_rows += 1
@@ -439,12 +511,33 @@ def map_employee_ids(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replace Employee ID values in an Agency workbook with ADP File Numbers "
+            "Map 7-digit employee IDs to ADP File Numbers "
             "using a master validation workbook."
         )
     )
     parser.add_argument("--agency", required=True, help="Path to Agency workbook (.xlsx)")
     parser.add_argument("--master", required=True, help="Path to master workbook (.xlsx)")
+    parser.add_argument(
+        "--agency-sheet-name",
+        required=False,
+        help=(
+            "Optional: sheet name in agency workbook to transform (for example: "
+            "'Total Hours')."
+        ),
+    )
+    parser.add_argument(
+        "--source-id-column-header",
+        default="Employee ID",
+        help="Header for source 7-digit employee ID column. Default: Employee ID.",
+    )
+    parser.add_argument(
+        "--target-column-header",
+        required=False,
+        help=(
+            "Optional: header for output ADP ID column. If omitted, script writes to "
+            "File # / File Number when present, otherwise Employee ID."
+        ),
+    )
     parser.add_argument(
         "--output",
         required=False,
@@ -492,6 +585,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             master_workbook_path=master_path,
             output_path=output_path,
             exceptions_sheet_name=args.exceptions_sheet_name,
+            agency_sheet_name=args.agency_sheet_name,
+            source_id_column_header=args.source_id_column_header,
+            target_column_header=args.target_column_header,
         )
     except Exception:
         LOGGER.exception("Failed while mapping employee IDs.")
